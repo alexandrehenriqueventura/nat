@@ -25,7 +25,6 @@ export default function App() {
   const { data: companies = [] } = useQuery({
     queryKey: ['companies'],
     queryFn: fetchCompanies,
-    staleTime: 30_000,
   })
 
   // Filtra dispositivos por busca, status e empresa

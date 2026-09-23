@@ -1,55 +1,42 @@
-// Hook que mantém a lista de dispositivos sempre atualizada.
-// Faz polling a cada 10s para simular atualizações em tempo real.
-// Quando o servidor estiver pronto, o polling será substituído por SSE.
+// Hook que mantém a lista de dispositivos sincronizada em tempo real com o Cloud Firestore.
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
+import { collection, onSnapshot } from 'firebase/firestore'
+import { db } from '@/lib/firebase'
 import { fetchDevices, getDashboardMetrics } from '@/lib/api'
 
 export function useDevices() {
+  const queryClient = useQueryClient()
+
+  // 1. Query inicial com cache
   const { data: devices = [], isLoading, error } = useQuery({
     queryKey: ['devices'],
     queryFn: fetchDevices,
-    refetchInterval: 10_000,   // atualiza a cada 10 segundos
-    staleTime:        5_000,
+    staleTime: Infinity, // Mantido fresco pelo listener onSnapshot
   })
+
+  // 2. Listener em tempo real do Cloud Firestore
+  useEffect(() => {
+    try {
+      const unsubscribe = onSnapshot(collection(db, 'devices'), () => {
+        // Invalida o cache e força atualização imediata dos dados
+        queryClient.invalidateQueries({ queryKey: ['devices'] })
+      }, (err) => {
+        console.warn('Erro na sincronização em tempo real do Firestore:', err)
+      })
+
+      return () => unsubscribe()
+    } catch (err) {
+      console.warn('Falha ao inicializar listener do Firestore:', err)
+    }
+  }, [queryClient])
 
   const metrics = getDashboardMetrics(devices)
 
   return { devices, metrics, isLoading, error }
 }
 
-// Hook para invalidar o cache de dispositivos ao receber
-// um evento SSE do servidor.
+// Hook de compatibilidade (não mais necessário com Firestore, mantido para evitar quebras)
 export function useSSEDeviceUpdates() {
-  const queryClient = useQueryClient()
-
-  useEffect(() => {
-    let eventSource: EventSource | null = null
-
-    try {
-      eventSource = new EventSource('/events/devices')
-
-      const invalidate = () => {
-        queryClient.invalidateQueries({ queryKey: ['devices'] })
-      }
-
-      eventSource.addEventListener('device.connected', invalidate)
-      eventSource.addEventListener('device.disconnected', invalidate)
-      eventSource.addEventListener('device.heartbeat', invalidate)
-      eventSource.addEventListener('command.result', invalidate)
-
-      eventSource.onerror = () => {
-        // SSE falhou ou servidor indisponível — o polling cobre
-        if (eventSource?.readyState === EventSource.CLOSED) {
-          eventSource.close()
-        }
-      }
-    } catch {
-      // Falha silenciosa se SSE não estiver disponível
-    }
-
-    return () => {
-      eventSource?.close()
-    }
-  }, [queryClient])
+  // O onSnapshot dentro de useDevices já gerencia tudo em tempo real
 }

@@ -1,12 +1,8 @@
 {
-  "server_url": "ws://localhost:8080/ws/agent",
-  "auth_token": "TROQUE_PELO_TOKEN_SECRETO",
+  "project_id": "seu-projeto-firebase",
+  "credentials_file": "service_account.json",
   "hostname_override": "",
-  "alias": "Terminal Teste Mac",
+  "alias": "Terminal Caixa",
   "log_level": "info",
-  "reconnect": {
-    "initial_delay_s": 1,
-    "max_delay_s": 60,
-    "max_attempts": 0
-  }
+  "heartbeat_interval_s": 10
 }

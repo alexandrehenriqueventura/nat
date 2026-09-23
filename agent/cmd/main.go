@@ -36,17 +36,13 @@ func main() {
 	logger := buildLogger(cfg.LogLevel)
 	logger.Info("NAT Agent iniciando",
 		"version", "1.0.0",
-		"server", cfg.ServerURL,
+		"project_id", cfg.ProjectID,
 		"hostname_override", cfg.HostnameOverride,
 	)
 
 	// ── 3. Valida configuração mínima ─────────────────────
-	if cfg.ServerURL == "" {
-		logger.Error("server_url não configurado no config.json")
-		os.Exit(1)
-	}
-	if cfg.AuthToken == "" {
-		logger.Error("auth_token não configurado no config.json")
+	if cfg.ProjectID == "" {
+		logger.Error("project_id não configurado no config.json (insira o ID do seu projeto Firebase)")
 		os.Exit(1)
 	}
 
@@ -85,11 +81,8 @@ func loadConfig(path string) (agent.Config, error) {
 	}
 
 	// Valores padrão
-	if cfg.Reconnect.InitialDelayS == 0 {
-		cfg.Reconnect.InitialDelayS = 1
-	}
-	if cfg.Reconnect.MaxDelayS == 0 {
-		cfg.Reconnect.MaxDelayS = 60
+	if cfg.HeartbeatIntervalS == 0 {
+		cfg.HeartbeatIntervalS = 10
 	}
 
 	return cfg, nil

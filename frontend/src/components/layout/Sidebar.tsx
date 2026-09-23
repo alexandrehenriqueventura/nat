@@ -1,5 +1,7 @@
-import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useState, useEffect } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { collection, onSnapshot } from 'firebase/firestore'
+import { db } from '@/lib/firebase'
 import { Monitor, Settings, LogOut, Building2, Plus, LayoutDashboard, ServerOff } from 'lucide-react'
 import { fetchCompanies, fetchDevices } from '@/lib/api'
 import { useAppStore } from '@/store/appStore'
@@ -7,20 +9,28 @@ import { CompanyManagerModal } from '@/components/company/CompanyManagerModal'
 import { cn } from '@/lib/utils'
 
 export function Sidebar() {
+  const queryClient = useQueryClient()
   const { companyFilter, setCompanyFilter, setStatusFilter, setSearchQuery } = useAppStore()
   const [showCompanyManager, setShowCompanyManager] = useState(false)
 
   const { data: companies = [] } = useQuery({
     queryKey: ['companies'],
     queryFn: fetchCompanies,
-    staleTime: 30_000,
   })
 
   const { data: devices = [] } = useQuery({
     queryKey: ['devices'],
     queryFn: fetchDevices,
-    staleTime: 10_000,
   })
+
+  useEffect(() => {
+    try {
+      const unsubscribe = onSnapshot(collection(db, 'companies'), () => {
+        queryClient.invalidateQueries({ queryKey: ['companies'] })
+      })
+      return () => unsubscribe()
+    } catch {}
+  }, [queryClient])
 
   // Conta terminais por empresa
   const countFor = (companyId: string | 'unassigned') =>

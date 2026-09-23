@@ -1,104 +1,181 @@
-// Camada de abstração de API.
-//
-// USE_MOCK=true  → usa dados locais (desenvolvimento sem servidor)
-// USE_MOCK=false → faz chamadas reais para o Servidor Go
-//
-// Para mudar de mock para real, basta trocar a variável abaixo.
+// Camada de API e comunicação direta com o Cloud Firestore.
+// Substitui a antiga REST API por operações diretas no Firestore com sincronização em tempo real.
 
+import {
+  collection,
+  doc,
+  getDocs,
+  getDoc,
+  setDoc,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  writeBatch,
+  serverTimestamp,
+  onSnapshot,
+  query,
+  orderBy,
+  Timestamp,
+} from 'firebase/firestore'
+import { db } from './firebase'
 import type {
   Device, Company, Share, LocalUser,
   SetIPPayload, CreateSharePayload, CreateUserPayload,
-  CommandResult, DashboardMetrics,
+  CommandResult, DashboardMetrics, DeviceAlert, NetworkInterface,
 } from '@/types'
-import {
-  MOCK_DEVICES, MOCK_COMPANIES, MOCK_SHARES, MOCK_USERS,
-} from './mock'
 
-const USE_MOCK = false
-const API_BASE = '/api'
+// ─────────────────────────────────────────────
+// HELPERS DE FORMATAÇÃO E STATUS
+// ─────────────────────────────────────────────
 
-// Estado mutável do mock (permite criar/editar/excluir sem recarregar)
-let _devices   = [...MOCK_DEVICES]
-let _companies = [...MOCK_COMPANIES]
+function formatDeviceDoc(id: string, data: Record<string, unknown>): Device {
+  const lastSeenRaw = data.last_seen
+  let lastSeenISO = new Date(0).toISOString()
 
-const delay = (ms = 500) => new Promise(r => setTimeout(r, ms))
+  if (lastSeenRaw instanceof Timestamp) {
+    lastSeenISO = lastSeenRaw.toDate().toISOString()
+  } else if (typeof lastSeenRaw === 'string') {
+    lastSeenISO = lastSeenRaw
+  } else if (lastSeenRaw && typeof (lastSeenRaw as { toDate?: () => Date }).toDate === 'function') {
+    lastSeenISO = (lastSeenRaw as { toDate: () => Date }).toDate().toISOString()
+  }
 
-const mockCommandResult = async (
-  cmd_type: string,
-  status: CommandResult['status'] = 'ok',
-  data: Record<string, unknown> = {},
-): Promise<CommandResult> => {
-  await delay(1500)
-  return { command_id: `mock-${Date.now()}`, cmd_type, status, data, ts: new Date().toISOString() }
+  // Verifica se está online (visto nos últimos 30 segundos)
+  const lastSeenMs = new Date(lastSeenISO).getTime()
+  const isOnline = Date.now() - lastSeenMs < 35_000
+
+  let status: Device['status'] = isOnline ? 'online' : 'offline'
+
+  const cpuPct = Number(data.cpu_pct || 0)
+  const ramUsed = Number(data.ram_used_mb || 0)
+  const ramTotal = Number(data.ram_total_mb || 0)
+  const diskFree = Number(data.disk_free_gb || 0)
+
+  const alerts: DeviceAlert[] = []
+
+  if (isOnline) {
+    if (cpuPct >= 90) {
+      alerts.push({
+        severity: 'critical',
+        code: 'CPU_HIGH',
+        message: 'CPU acima de 90%',
+        ts: new Date().toISOString(),
+      })
+    }
+    if (ramTotal > 0 && (ramUsed / ramTotal) >= 0.9) {
+      alerts.push({
+        severity: 'critical',
+        code: 'RAM_HIGH',
+        message: 'RAM acima de 90%',
+        ts: new Date().toISOString(),
+      })
+    }
+    if (diskFree > 0 && diskFree < 10) {
+      alerts.push({
+        severity: 'warning',
+        code: 'DISK_LOW',
+        message: 'Espaço em disco C: abaixo de 10 GB',
+        ts: new Date().toISOString(),
+      })
+    }
+    if (alerts.length > 0) {
+      status = 'alert'
+    }
+  }
+
+  return {
+    id,
+    hostname: (data.hostname as string) || id,
+    alias: (data.alias as string) || (data.hostname as string) || id,
+    status,
+    os: (data.os as string) || 'Windows',
+    agent_ver: (data.agent_ver as string) || '1.0.0',
+    last_seen: lastSeenISO,
+    uptime_s: Number(data.uptime_s || 0),
+    cpu_pct: cpuPct,
+    ram_used_mb: ramUsed,
+    ram_total_mb: ramTotal,
+    disk_free_gb: diskFree,
+    interfaces: (data.interfaces as NetworkInterface[]) || [],
+    alerts,
+    company_id: (data.company_id as string) || null,
+  }
 }
 
 // ─────────────────────────────────────────────
-// EMPRESAS
+// EMPRESAS (CRUD FIRESTORE)
 // ─────────────────────────────────────────────
 
 export async function fetchCompanies(): Promise<Company[]> {
-  if (USE_MOCK) {
-    await delay(300)
-    return [..._companies]
+  try {
+    const snap = await getDocs(query(collection(db, 'companies'), orderBy('name', 'asc')))
+    return snap.docs.map(d => {
+      const data = d.data()
+      let createdAt = new Date().toISOString()
+      if (data.created_at instanceof Timestamp) {
+        createdAt = data.created_at.toDate().toISOString()
+      }
+      return {
+        id: d.id,
+        name: data.name || '',
+        description: data.description || '',
+        color: data.color || '#3b82f6',
+        created_at: createdAt,
+      }
+    })
+  } catch (err) {
+    console.warn('Erro ao buscar empresas no Firestore:', err)
+    return []
   }
-  const res = await fetch(`${API_BASE}/companies`)
-  if (!res.ok) throw new Error('Falha ao buscar empresas')
-  return res.json()
 }
 
 export async function createCompany(data: Omit<Company, 'id' | 'created_at'>): Promise<Company> {
-  if (USE_MOCK) {
-    await delay(400)
-    const company: Company = {
-      ...data,
-      id: `empresa-${Date.now()}`,
-      created_at: new Date().toISOString(),
-    }
-    _companies = [..._companies, company]
-    return company
-  }
-  const res = await fetch(`${API_BASE}/companies`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
+  const docRef = await addDoc(collection(db, 'companies'), {
+    ...data,
+    created_at: serverTimestamp(),
   })
-  if (!res.ok) {
-    const errText = await res.text()
-    throw new Error(errText || 'Falha ao criar empresa')
+  return {
+    ...data,
+    id: docRef.id,
+    created_at: new Date().toISOString(),
   }
-  return res.json()
 }
 
 export async function updateCompany(id: string, data: Partial<Omit<Company, 'id' | 'created_at'>>): Promise<Company> {
-  if (USE_MOCK) {
-    await delay(400)
-    _companies = _companies.map(c => c.id === id ? { ...c, ...data } : c)
-    return _companies.find(c => c.id === id)!
-  }
-  const res = await fetch(`${API_BASE}/companies/${id}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
+  const ref = doc(db, 'companies', id)
+  await updateDoc(ref, {
+    ...data,
+    updated_at: serverTimestamp(),
   })
-  if (!res.ok) {
-    const errText = await res.text()
-    throw new Error(errText || 'Falha ao atualizar empresa')
+  const snap = await getDoc(ref)
+  const snapData = snap.data() || {}
+  return {
+    id,
+    name: snapData.name || '',
+    description: snapData.description || '',
+    color: snapData.color || '#3b82f6',
+    created_at: new Date().toISOString(),
   }
-  return res.json()
 }
 
 export async function deleteCompany(id: string): Promise<void> {
-  if (USE_MOCK) {
-    await delay(400)
-    _companies = _companies.filter(c => c.id !== id)
-    // Desassocia terminais que pertenciam a esta empresa
-    _devices = _devices.map(d => d.company_id === id ? { ...d, company_id: null } : d)
-    return
-  }
-  const res = await fetch(`${API_BASE}/companies/${id}`, { method: 'DELETE' })
-  if (!res.ok) {
-    const errText = await res.text()
-    throw new Error(errText || 'Falha ao excluir empresa')
+  // Exclui a empresa
+  await deleteDoc(doc(db, 'companies', id))
+
+  // Desassocia os terminais vinculados
+  const devSnap = await getDocs(collection(db, 'devices'))
+  const batch = writeBatch(db)
+  let count = 0
+
+  devSnap.docs.forEach(d => {
+    if (d.data().company_id === id) {
+      batch.update(d.ref, { company_id: null })
+      count++
+    }
+  })
+
+  if (count > 0) {
+    await batch.commit()
   }
 }
 
@@ -108,105 +185,56 @@ export async function assignDeviceToCompany(
   deviceId: string,
   companyId: string | null,
 ): Promise<void> {
-  if (USE_MOCK) {
-    await delay(400)
-    _devices = _devices.map(d =>
-      d.id === deviceId ? { ...d, company_id: companyId } : d,
-    )
-    return
-  }
-  const res = await fetch(`${API_BASE}/devices/${deviceId}/company`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ company_id: companyId }),
+  await updateDoc(doc(db, 'devices', deviceId), {
+    company_id: companyId,
+    updated_at: serverTimestamp(),
   })
-  if (!res.ok) {
-    const errText = await res.text()
-    throw new Error(errText || 'Falha ao associar empresa')
-  }
 }
 
-// Atribui vários terminais a uma empresa de uma vez.
-// deviceIds = lista de IDs a associar à empresa
-// unlinkIds = lista de IDs a desassociar (setar company_id = null)
 export async function bulkAssignDevicesToCompany(
   deviceIds: string[],
   companyId: string,
   unlinkIds: string[] = [],
 ): Promise<void> {
-  if (USE_MOCK) {
-    await delay(500)
-    _devices = _devices.map(d => {
-      if (deviceIds.includes(d.id))  return { ...d, company_id: companyId }
-      if (unlinkIds.includes(d.id))  return { ...d, company_id: null }
-      return d
-    })
-    return
-  }
-  const res = await fetch(`${API_BASE}/companies/${companyId}/bulk-assign`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ assign: deviceIds, unlink: unlinkIds }),
+  const batch = writeBatch(db)
+  deviceIds.forEach(id => {
+    batch.update(doc(db, 'devices', id), { company_id: companyId, updated_at: serverTimestamp() })
   })
-  if (!res.ok) {
-    const errText = await res.text()
-    throw new Error(errText || 'Falha ao associar terminais')
-  }
+  unlinkIds.forEach(id => {
+    batch.update(doc(db, 'devices', id), { company_id: null, updated_at: serverTimestamp() })
+  })
+  await batch.commit()
 }
 
-// Associa vários terminais a uma empresa (seleção em lote da tabela)
 export async function bulkSetCompany(
   deviceIds: string[],
   companyId: string | null,
 ): Promise<void> {
-  if (USE_MOCK) {
-    await delay(500)
-    _devices = _devices.map(d =>
-      deviceIds.includes(d.id) ? { ...d, company_id: companyId } : d,
-    )
-    return
-  }
-  const res = await fetch(`${API_BASE}/devices/bulk-company`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ device_ids: deviceIds, company_id: companyId }),
+  const batch = writeBatch(db)
+  deviceIds.forEach(id => {
+    batch.update(doc(db, 'devices', id), { company_id: companyId, updated_at: serverTimestamp() })
   })
-  if (!res.ok) {
-    const errText = await res.text()
-    throw new Error(errText || 'Falha na associação em lote')
-  }
+  await batch.commit()
 }
 
 // ─────────────────────────────────────────────
-// DISPOSITIVOS
+// DISPOSITIVOS (FIRESTORE)
 // ─────────────────────────────────────────────
 
 export async function fetchDevices(): Promise<Device[]> {
-  if (USE_MOCK) {
-    await delay(400)
-    return _devices.map(d => ({
-      ...d,
-      cpu_pct: d.status === 'online' || d.status === 'alert'
-        ? Math.min(100, Math.max(5, d.cpu_pct + (Math.random() * 10 - 5)))
-        : 0,
-      last_seen: d.status !== 'offline' ? new Date().toISOString() : d.last_seen,
-    }))
+  try {
+    const snap = await getDocs(collection(db, 'devices'))
+    return snap.docs.map(d => formatDeviceDoc(d.id, d.data()))
+  } catch (err) {
+    console.warn('Erro ao buscar dispositivos no Firestore:', err)
+    return []
   }
-  const res = await fetch(`${API_BASE}/devices`)
-  if (!res.ok) throw new Error('Falha ao buscar dispositivos')
-  return res.json()
 }
 
 export async function fetchDevice(id: string): Promise<Device> {
-  if (USE_MOCK) {
-    await delay(300)
-    const device = _devices.find(d => d.id === id)
-    if (!device) throw new Error('Dispositivo não encontrado')
-    return device
-  }
-  const res = await fetch(`${API_BASE}/devices/${id}`)
-  if (!res.ok) throw new Error('Falha ao buscar dispositivo')
-  return res.json()
+  const snap = await getDoc(doc(db, 'devices', id))
+  if (!snap.exists()) throw new Error('Dispositivo não encontrado')
+  return formatDeviceDoc(snap.id, snap.data())
 }
 
 export function getDashboardMetrics(devices: Device[]): DashboardMetrics {
@@ -219,34 +247,94 @@ export function getDashboardMetrics(devices: Device[]): DashboardMetrics {
 }
 
 // ─────────────────────────────────────────────
-// REDE
+// COMANDOS EM TEMPO REAL VIA FIRESTORE QUEUE
+// ─────────────────────────────────────────────
+
+export async function sendCommand(
+  deviceId: string,
+  cmdType: string,
+  payload: Record<string, unknown> = {},
+  timeoutMs = 25_000,
+): Promise<CommandResult> {
+  // 1. Cria o documento na subcoleção de comandos do dispositivo
+  const commandsCol = collection(db, 'devices', deviceId, 'commands')
+  const docRef = await addDoc(commandsCol, {
+    cmd_type: cmdType,
+    payload,
+    status: 'pending',
+    created_at: serverTimestamp(),
+    updated_at: serverTimestamp(),
+  })
+
+  // 2. Aguarda a resolução do comando pelo agente via listener em tempo real
+  return new Promise<CommandResult>((resolve) => {
+    let resolved = false
+
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true
+        unsubscribe()
+        resolve({
+          command_id: docRef.id,
+          cmd_type: cmdType,
+          status: 'error',
+          error: {
+            code: 'TIMEOUT',
+            message: 'O terminal não respondeu ao comando dentro do prazo de 25s.',
+          },
+          ts: new Date().toISOString(),
+        })
+      }
+    }, timeoutMs)
+
+    const unsubscribe = onSnapshot(docRef, (snap) => {
+      if (!snap.exists()) return
+      const data = snap.data()
+      const status = data.status as string
+
+      if (status === 'completed' || status === 'ok' || status === 'error' || status === 'rollback') {
+        if (!resolved) {
+          resolved = true
+          clearTimeout(timer)
+          unsubscribe()
+
+          resolve({
+            command_id: docRef.id,
+            cmd_type: cmdType,
+            status: status === 'completed' ? 'ok' : (status as CommandResult['status']),
+            data: data.result_data || data.data || {},
+            error: data.error,
+            ts: new Date().toISOString(),
+          })
+        }
+      }
+    }, (err) => {
+      if (!resolved) {
+        resolved = true
+        clearTimeout(timer)
+        unsubscribe()
+        resolve({
+          command_id: docRef.id,
+          cmd_type: cmdType,
+          status: 'error',
+          error: { code: 'FIRESTORE_ERROR', message: err.message },
+          ts: new Date().toISOString(),
+        })
+      }
+    })
+  })
+}
+
+// ─────────────────────────────────────────────
+// AÇÕES DE REDE
 // ─────────────────────────────────────────────
 
 export async function setDeviceIP(deviceId: string, payload: SetIPPayload): Promise<CommandResult> {
-  if (USE_MOCK) {
-    const isRollback = payload.ip === '192.168.1.99'
-    return mockCommandResult('cmd.net.set_ip', isRollback ? 'rollback' : 'ok',
-      isRollback ? {} : { new_ip: payload.ip, interface_name: payload.interface_name })
-  }
-  const res = await fetch(`${API_BASE}/devices/${deviceId}/command`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'cmd.net.set_ip', payload }),
-  })
-  return res.json()
+  return sendCommand(deviceId, 'cmd.net.set_ip', payload as unknown as Record<string, unknown>)
 }
 
 export async function setDeviceDHCP(deviceId: string, interfaceName: string): Promise<CommandResult> {
-  if (USE_MOCK) {
-    return mockCommandResult('cmd.net.set_dhcp', 'ok', {
-      ip_obtained: '192.168.1.' + Math.floor(Math.random() * 50 + 100),
-      interface_name: interfaceName,
-    })
-  }
-  const res = await fetch(`${API_BASE}/devices/${deviceId}/command`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'cmd.net.set_dhcp', payload: { interface_name: interfaceName } }),
-  })
-  return res.json()
+  return sendCommand(deviceId, 'cmd.net.set_dhcp', { interface_name: interfaceName })
 }
 
 // ─────────────────────────────────────────────
@@ -254,17 +342,7 @@ export async function setDeviceDHCP(deviceId: string, interfaceName: string): Pr
 // ─────────────────────────────────────────────
 
 export async function fetchShares(deviceId: string): Promise<Share[]> {
-  if (USE_MOCK) {
-    await delay(500)
-    return MOCK_SHARES[deviceId] ?? []
-  }
-  const res = await fetch(`${API_BASE}/devices/${deviceId}/command`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'cmd.share.list', payload: {} }),
-  })
-  if (!res.ok) return []
-  const result: CommandResult = await res.json()
+  const result = await sendCommand(deviceId, 'cmd.share.list', {})
   if (result.status === 'ok' && result.data?.raw) {
     try {
       const parsed = JSON.parse(result.data.raw as string)
@@ -277,21 +355,11 @@ export async function fetchShares(deviceId: string): Promise<Share[]> {
 }
 
 export async function createShare(deviceId: string, payload: CreateSharePayload): Promise<CommandResult> {
-  if (USE_MOCK) return mockCommandResult('cmd.share.create', 'ok', { name: payload.name, local_path: payload.local_path, dir_created: payload.create_if_not_exists })
-  const res = await fetch(`${API_BASE}/devices/${deviceId}/command`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'cmd.share.create', payload }),
-  })
-  return res.json()
+  return sendCommand(deviceId, 'cmd.share.create', payload as unknown as Record<string, unknown>)
 }
 
 export async function deleteShare(deviceId: string, shareName: string, deleteLocalDir = false): Promise<CommandResult> {
-  if (USE_MOCK) return mockCommandResult('cmd.share.delete', 'ok', { deleted: shareName })
-  const res = await fetch(`${API_BASE}/devices/${deviceId}/command`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'cmd.share.delete', payload: { name: shareName, delete_local_dir: deleteLocalDir } }),
-  })
-  return res.json()
+  return sendCommand(deviceId, 'cmd.share.delete', { name: shareName, delete_local_dir: deleteLocalDir })
 }
 
 // ─────────────────────────────────────────────
@@ -299,17 +367,7 @@ export async function deleteShare(deviceId: string, shareName: string, deleteLoc
 // ─────────────────────────────────────────────
 
 export async function fetchUsers(deviceId: string): Promise<LocalUser[]> {
-  if (USE_MOCK) {
-    await delay(500)
-    return MOCK_USERS[deviceId] ?? []
-  }
-  const res = await fetch(`${API_BASE}/devices/${deviceId}/command`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'cmd.user.list', payload: {} }),
-  })
-  if (!res.ok) return []
-  const result: CommandResult = await res.json()
+  const result = await sendCommand(deviceId, 'cmd.user.list', {})
   if (result.status === 'ok' && result.data?.raw) {
     try {
       const parsed = JSON.parse(result.data.raw as string)
@@ -331,28 +389,13 @@ export async function fetchUsers(deviceId: string): Promise<LocalUser[]> {
 }
 
 export async function createUser(deviceId: string, payload: CreateUserPayload): Promise<CommandResult> {
-  if (USE_MOCK) return mockCommandResult('cmd.user.create', 'ok', { username: payload.username, created: true })
-  const res = await fetch(`${API_BASE}/devices/${deviceId}/command`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'cmd.user.create', payload }),
-  })
-  return res.json()
+  return sendCommand(deviceId, 'cmd.user.create', payload as unknown as Record<string, unknown>)
 }
 
 export async function toggleUserStatus(deviceId: string, username: string, enabled: boolean): Promise<CommandResult> {
-  if (USE_MOCK) return mockCommandResult('cmd.user.toggle_status', 'ok', { username, enabled })
-  const res = await fetch(`${API_BASE}/devices/${deviceId}/command`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'cmd.user.toggle_status', payload: { username, enabled } }),
-  })
-  return res.json()
+  return sendCommand(deviceId, 'cmd.user.toggle_status', { username, enabled })
 }
 
 export async function resetUserPassword(deviceId: string, username: string, newPassword: string): Promise<CommandResult> {
-  if (USE_MOCK) return mockCommandResult('cmd.user.set_password', 'ok', { username, updated: true })
-  const res = await fetch(`${API_BASE}/devices/${deviceId}/command`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'cmd.user.set_password', payload: { username, new_password: newPassword } }),
-  })
-  return res.json()
+  return sendCommand(deviceId, 'cmd.user.set_password', { username, new_password: newPassword })
 }

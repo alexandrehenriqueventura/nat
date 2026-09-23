@@ -1,390 +1,310 @@
-// Package agent implementa o núcleo do agente:
-// – Conexão WebSocket com reconexão automática (backoff exponencial)
-// – Envio do payload de registro (agent.register)
-// – Loop de heartbeat em goroutine dedicada
-// – Loop de leitura de comandos e despacho para o Executor
+// Package agent implementa o núcleo do agente integrado ao Cloud Firestore:
+// – Registro inicial e telemetria (CPU, RAM, Disco, Rede, Uptime) a cada 10s
+// – Listener em tempo real da fila de comandos (devices/{hostname}/commands)
+// – Execução de comandos PowerShell e atualização do status no Firestore
 package agent
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"log/slog"
-	"math"
-	"net/http"
-	"net/url"
-	"sync"
+	"os"
 	"time"
 
-	"github.com/gorilla/websocket"
-	"github.com/google/uuid"
+	"cloud.google.com/go/firestore"
+	"google.golang.org/api/option"
 
 	"github.com/nat/agent/internal/executor"
 	"github.com/nat/agent/internal/sysinfo"
 	"github.com/nat/agent/internal/types"
 )
 
-// Config contém todos os parâmetros do agente lidos do config.json.
+// Config contém os parâmetros do agente lidos do config.json.
 type Config struct {
-	ServerURL        string          `json:"server_url"`
-	AuthToken        string          `json:"auth_token"`
-	HostnameOverride string          `json:"hostname_override"`
-	Alias            string          `json:"alias"`
-	LogLevel         string          `json:"log_level"`
-	Reconnect        ReconnectConfig `json:"reconnect"`
+	ProjectID          string `json:"project_id"`
+	CredentialsFile    string `json:"credentials_file"`
+	HostnameOverride   string `json:"hostname_override"`
+	Alias              string `json:"alias"`
+	LogLevel           string `json:"log_level"`
+	HeartbeatIntervalS int    `json:"heartbeat_interval_s"`
 }
 
-// ReconnectConfig configura a política de reconexão.
-type ReconnectConfig struct {
-	InitialDelayS int `json:"initial_delay_s"`
-	MaxDelayS     int `json:"max_delay_s"`
-	MaxAttempts   int `json:"max_attempts"` // 0 = infinito
-}
-
-// ─────────────────────────────────────────────
-// AGENTE PRINCIPAL
-// ─────────────────────────────────────────────
-
-// Agent é a estrutura central que gerencia toda a vida da conexão.
+// Agent gerencia o ciclo de vida do agente com o Cloud Firestore.
 type Agent struct {
 	cfg      Config
 	hostname string
+	client   *firestore.Client
+	executor *executor.Executor
 	logger   *slog.Logger
-
-	// mu protege o acesso concorrente à conexão WebSocket.
-	mu   sync.Mutex
-	conn *websocket.Conn
-
-	// heartbeatInterval é atualizado pelo server no register.ack.
-	heartbeatInterval time.Duration
-
-	// stopCh é fechado quando o agente deve encerrar.
-	stopCh chan struct{}
+	stopCh   chan struct{}
 }
 
-// New cria um novo Agent com a configuração fornecida.
+// New cria uma nova instância do Agent.
 func New(cfg Config, logger *slog.Logger) *Agent {
-	return &Agent{
-		cfg:               cfg,
-		hostname:          sysinfo.GetHostname(cfg.HostnameOverride),
-		logger:            logger,
-		heartbeatInterval: 10 * time.Second, // padrão até o servidor dizer diferente
-		stopCh:            make(chan struct{}),
+	hostname := sysinfo.GetHostname(cfg.HostnameOverride)
+	if cfg.HeartbeatIntervalS == 0 {
+		cfg.HeartbeatIntervalS = 10
 	}
+
+	a := &Agent{
+		cfg:      cfg,
+		hostname: hostname,
+		logger:   logger,
+		stopCh:   make(chan struct{}),
+	}
+	a.executor = executor.New(hostname, a, logger)
+	return a
 }
 
-// Run inicia o agente. Bloqueia até que stopCh seja fechado.
-// Em caso de desconexão, reconecta automaticamente com backoff exponencial.
+// Run inicia o agente: conecta ao Firestore, registra telemetria e escuta comandos.
 func (a *Agent) Run() {
-	a.logger.Info("agente iniciando", "hostname", a.hostname)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	attempt := 0
-	for {
-		select {
-		case <-a.stopCh:
-			a.logger.Info("agente encerrando")
-			return
-		default:
+	var opts []option.ClientOption
+	if a.cfg.CredentialsFile != "" {
+		if _, err := os.Stat(a.cfg.CredentialsFile); err == nil {
+			opts = append(opts, option.WithCredentialsFile(a.cfg.CredentialsFile))
+			a.logger.Info("usando arquivo de credenciais", "path", a.cfg.CredentialsFile)
+		} else {
+			a.logger.Warn("arquivo de credenciais não encontrado, tentando ADC padrão", "path", a.cfg.CredentialsFile)
 		}
-
-		attempt++
-		a.logger.Info("conectando ao servidor", "url", a.cfg.ServerURL, "tentativa", attempt)
-
-		conn, err := a.connect()
-		if err != nil {
-			delay := a.backoffDelay(attempt)
-			a.logger.Warn("falha na conexão, aguardando para tentar novamente",
-				"err", err, "delay", delay)
-			time.Sleep(delay)
-			continue
-		}
-
-		// Conexão estabelecida — salva a conexão e inicia os loops
-		a.mu.Lock()
-		a.conn = conn
-		a.mu.Unlock()
-
-		attempt = 0 // reseta contador após conexão bem-sucedida
-
-		// Registra o agente junto ao servidor
-		if err := a.register(); err != nil {
-			a.logger.Error("falha no registro", "err", err)
-			conn.Close()
-			continue
-		}
-
-		// Inicia o loop de heartbeat em background
-		heartbeatStop := make(chan struct{})
-		go a.heartbeatLoop(heartbeatStop)
-
-		// Bloqueia no loop de leitura até a conexão cair
-		a.readLoop()
-
-		// Conexão encerrada — para o heartbeat e reconecta
-		close(heartbeatStop)
-		conn.Close()
-
-		a.logger.Warn("conexão perdida, reconectando...")
-		time.Sleep(a.backoffDelay(1))
 	}
+
+	client, err := firestore.NewClient(ctx, a.cfg.ProjectID, opts...)
+	if err != nil {
+		a.logger.Error("falha ao conectar ao Cloud Firestore", "err", err, "project_id", a.cfg.ProjectID)
+		return
+	}
+	a.client = client
+	defer client.Close()
+
+	a.logger.Info("conectado com sucesso ao Cloud Firestore", "project_id", a.cfg.ProjectID, "hostname", a.hostname)
+
+	// 1. Registro inicial do dispositivo
+	if err := a.registerDevice(ctx); err != nil {
+		a.logger.Warn("falha no registro inicial do dispositivo", "err", err)
+	}
+
+	// 2. Loop de telemetria / heartbeat em background
+	go a.heartbeatLoop(ctx)
+
+	// 3. Loop de escuta de comandos em tempo real
+	a.commandListenLoop(ctx)
 }
 
-// Stop encerra o agente de forma graciosa.
+// Stop sinaliza o encerramento gracioso do agente.
 func (a *Agent) Stop() {
 	close(a.stopCh)
-	a.mu.Lock()
-	if a.conn != nil {
-		a.conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(1001, "agente encerrando"))
-		a.conn.Close()
+	if a.client != nil {
+		_ = a.client.Close()
 	}
-	a.mu.Unlock()
 }
 
 // ─────────────────────────────────────────────
-// CONEXÃO
+// REGISTRO & HEARTBEAT
 // ─────────────────────────────────────────────
 
-// connect estabelece a conexão WebSocket com o servidor,
-// adicionando o token de autenticação na query string.
-func (a *Agent) connect() (*websocket.Conn, error) {
-	u, err := url.Parse(a.cfg.ServerURL)
+func (a *Agent) registerDevice(ctx context.Context) error {
+	osName := sysinfo.GetOS()
+	mac := sysinfo.GetMACAddress()
+	ifaces := sysinfo.GetInterfaces()
+	cpuPct, ramUsed, ramTotal, diskFree, uptimeS := sysinfo.GetHeartbeatMetrics()
+
+	alias := a.cfg.Alias
+	if alias == "" {
+		alias = a.hostname
+	}
+
+	docRef := a.client.Collection("devices").Doc(a.hostname)
+	_, err := docRef.Set(ctx, map[string]interface{}{
+		"hostname":     a.hostname,
+		"alias":        alias,
+		"os":           osName,
+		"arch":         "amd64",
+		"agent_ver":    "1.0.0",
+		"mac_address":  mac,
+		"interfaces":   ifaces,
+		"cpu_pct":      cpuPct,
+		"ram_used_mb":  ramUsed,
+		"ram_total_mb": ramTotal,
+		"disk_free_gb": diskFree,
+		"uptime_s":     uptimeS,
+		"last_seen":    firestore.ServerTimestamp,
+	}, firestore.MergeAll)
+
 	if err != nil {
-		return nil, fmt.Errorf("URL inválida: %w", err)
+		return fmt.Errorf("salvando registro no Firestore: %w", err)
 	}
 
-	q := u.Query()
-	q.Set("token", a.cfg.AuthToken)
-	u.RawQuery = q.Encode()
-
-	header := http.Header{}
-	header.Set("User-Agent", fmt.Sprintf("NAT-Agent/%s", sysinfo.AgentVersion))
-
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-	}
-
-	conn, resp, err := dialer.Dial(u.String(), header)
-	if err != nil {
-		if resp != nil {
-			return nil, fmt.Errorf("handshake falhou (HTTP %d): %w", resp.StatusCode, err)
-		}
-		return nil, fmt.Errorf("falha ao discar: %w", err)
-	}
-
-	a.logger.Info("WebSocket conectado", "remote", conn.RemoteAddr())
-	return conn, nil
-}
-
-// ─────────────────────────────────────────────
-// REGISTRO
-// ─────────────────────────────────────────────
-
-// register envia o payload agent.register e aguarda o ack do servidor.
-func (a *Agent) register() error {
-	payload := types.RegisterPayload{
-		Hostname:   a.hostname,
-		Alias:      a.cfg.Alias,
-		OS:         sysinfo.GetOS(),
-		Arch:       "amd64",
-		AgentVer:   sysinfo.AgentVersion,
-		MACAddress: sysinfo.GetMACAddress(),
-		Interfaces: sysinfo.GetInterfaces(),
-	}
-
-	msg := types.Message{
-		MsgID:   uuid.NewString(),
-		Type:    types.TypeAgentRegister,
-		Ts:      time.Now().UTC(),
-		Payload: payload,
-	}
-
-	if err := a.Send(msg); err != nil {
-		return fmt.Errorf("falha ao enviar register: %w", err)
-	}
-
-	a.logger.Info("agent.register enviado, aguardando ack...")
-
-	// Aguarda o register.ack com timeout de 10 segundos
-	a.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	defer a.conn.SetReadDeadline(time.Time{}) // remove deadline após o ack
-
-	_, data, err := a.conn.ReadMessage()
-	if err != nil {
-		return fmt.Errorf("falha ao ler register.ack: %w", err)
-	}
-
-	var ack types.Message
-	if err := json.Unmarshal(data, &ack); err != nil {
-		return fmt.Errorf("ack inválido: %w", err)
-	}
-
-	if ack.Type != types.TypeAgentRegisterAck {
-		return fmt.Errorf("esperado register.ack, recebido: %s", ack.Type)
-	}
-
-	// Extrai o intervalo de heartbeat configurado pelo servidor
-	if raw, ok := ack.Payload.(map[string]interface{}); ok {
-		if interval, ok := raw["heartbeat_interval_s"].(float64); ok && interval > 0 {
-			a.heartbeatInterval = time.Duration(interval) * time.Second
-		}
-	}
-
-	a.logger.Info("registro aceito pelo servidor",
-		"heartbeat_interval", a.heartbeatInterval)
+	a.logger.Info("dispositivo registrado no Firestore", "hostname", a.hostname)
 	return nil
 }
 
-// ─────────────────────────────────────────────
-// HEARTBEAT
-// ─────────────────────────────────────────────
-
-// heartbeatLoop envia heartbeats periodicamente até stopCh ser fechado.
-func (a *Agent) heartbeatLoop(stop <-chan struct{}) {
-	ticker := time.NewTicker(a.heartbeatInterval)
+func (a *Agent) heartbeatLoop(ctx context.Context) {
+	interval := time.Duration(a.cfg.HeartbeatIntervalS) * time.Second
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	a.logger.Info("heartbeat iniciado", "interval", a.heartbeatInterval)
+	docRef := a.client.Collection("devices").Doc(a.hostname)
 
 	for {
 		select {
-		case <-stop:
-			a.logger.Info("heartbeat encerrado")
+		case <-a.stopCh:
+			return
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := a.sendHeartbeat(); err != nil {
-				a.logger.Warn("falha ao enviar heartbeat", "err", err)
-				// Não fecha a conexão aqui — deixa o readLoop detectar a falha
+			cpuPct, ramUsed, ramTotal, diskFree, uptimeS := sysinfo.GetHeartbeatMetrics()
+			ifaces := sysinfo.GetInterfaces()
+
+			_, err := docRef.Set(ctx, map[string]interface{}{
+				"cpu_pct":      cpuPct,
+				"ram_used_mb":  ramUsed,
+				"ram_total_mb": ramTotal,
+				"disk_free_gb": diskFree,
+				"uptime_s":     uptimeS,
+				"interfaces":   ifaces,
+				"last_seen":    firestore.ServerTimestamp,
+			}, firestore.MergeAll)
+
+			if err != nil {
+				a.logger.Warn("falha ao enviar heartbeat ao Firestore", "err", err)
+			} else {
+				a.logger.Debug("heartbeat enviado", "cpu", cpuPct, "ram_used", ramUsed)
 			}
 		}
 	}
 }
 
-// sendHeartbeat coleta métricas e envia o payload agent.heartbeat.
-func (a *Agent) sendHeartbeat() error {
-	cpu, ramUsed, ramTotal, diskFree, uptime := sysinfo.GetHeartbeatMetrics()
-	ifaces := sysinfo.GetInterfaces()
-
-	// Converte interfaces para o formato resumido do heartbeat
-	hbIfaces := make([]types.HeartbeatInterface, 0, len(ifaces))
-	for _, iface := range ifaces {
-		hbIfaces = append(hbIfaces, types.HeartbeatInterface{
-			Name:   iface.Name,
-			IP:     iface.IP,
-			IsDHCP: iface.IsDHCP,
-		})
-	}
-
-	msg := types.Message{
-		MsgID: uuid.NewString(),
-		Type:  types.TypeAgentHeartbeat,
-		Ts:    time.Now().UTC(),
-		Payload: types.HeartbeatPayload{
-			Hostname:   a.hostname,
-			UptimeS:    uptime,
-			CPUPct:     cpu,
-			RAMUsedMB:  ramUsed,
-			RAMTotalMB: ramTotal,
-			DiskFreeGB: diskFree,
-			Interfaces: hbIfaces,
-		},
-	}
-
-	a.logger.Debug("enviando heartbeat",
-		"cpu", fmt.Sprintf("%.1f%%", cpu),
-		"ram", fmt.Sprintf("%d/%d MB", ramUsed, ramTotal))
-
-	return a.Send(msg)
-}
-
 // ─────────────────────────────────────────────
-// LOOP DE LEITURA DE COMANDOS
+// ESCUTA DE COMANDOS (FILA EM TEMPO REAL)
 // ─────────────────────────────────────────────
 
-// readLoop lê mensagens do servidor em loop até a conexão ser encerrada.
-// Despacha cada comando recebido para o Executor em uma goroutine separada.
-func (a *Agent) readLoop() {
-	exec := executor.New(a.hostname, a, a.logger)
-
-	a.logger.Info("aguardando comandos do servidor...")
+func (a *Agent) commandListenLoop(ctx context.Context) {
+	commandsCol := a.client.Collection("devices").Doc(a.hostname).Collection("commands")
+	q := commandsCol.Where("status", "==", "pending")
 
 	for {
-		_, data, err := a.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				a.logger.Info("conexão encerrada pelo servidor")
-			} else {
-				a.logger.Warn("erro na leitura do WebSocket", "err", err)
-			}
+		select {
+		case <-a.stopCh:
 			return
-		}
-
-		var raw types.RawMessage
-		if err := json.Unmarshal(data, &raw); err != nil {
-			a.logger.Warn("mensagem inválida recebida (JSON inválido)", "err", err)
-			continue
-		}
-
-		a.logger.Debug("mensagem recebida", "type", raw.Type, "msg_id", raw.MsgID)
-
-		switch raw.Type {
-		// Ack do heartbeat — apenas loga
-		case types.TypeAgentHeartbeatAck:
-			a.logger.Debug("heartbeat.ack recebido")
-
-		// Qualquer cmd.* vai para o Executor
+		case <-ctx.Done():
+			return
 		default:
-			if len(raw.Type) > 4 && raw.Type[:4] == "cmd." {
-				exec.Dispatch(raw)
-			} else {
-				a.logger.Warn("tipo de mensagem desconhecido ignorado", "type", raw.Type)
+			// Inicia listener de snapshots da query
+			iter := q.Snapshots(ctx)
+			a.logger.Info("aguardando comandos na fila do Firestore...")
+
+			for {
+				snap, err := iter.Next()
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					a.logger.Warn("erro no listener de comandos, reiniciando em 5s", "err", err)
+					time.Sleep(5 * time.Second)
+					break
+				}
+
+				for _, change := range snap.Changes {
+					if change.Kind == firestore.DocumentAdded || change.Kind == firestore.DocumentModified {
+						docSnap := change.Doc
+						data := docSnap.Data()
+
+						status, _ := data["status"].(string)
+						if status != "pending" {
+							continue
+						}
+
+						cmdType, _ := data["cmd_type"].(string)
+						payload, _ := data["payload"].(map[string]interface{})
+
+						a.logger.Info("novo comando pendente detectado", "id", docSnap.Ref.ID, "type", cmdType)
+
+						// 1. Marca imediatamente como "running" para evitar dupla execução
+						_, _ = docSnap.Ref.Update(ctx, []firestore.Update{
+							{Path: "status", Value: "running"},
+							{Path: "updated_at", Value: firestore.ServerTimestamp},
+						})
+
+						// 2. Despacha para o executor em goroutine
+						raw := types.RawMessage{
+							MsgID:   docSnap.Ref.ID,
+							Type:    cmdType,
+							Ts:      time.Now().UTC(),
+							Payload: payload,
+						}
+						a.executor.Dispatch(raw)
+					}
+				}
 			}
 		}
 	}
 }
 
 // ─────────────────────────────────────────────
-// ENVIO — implementa executor.Sender
+// IMPLEMENTAÇÃO DA INTERFACE executor.Sender
 // ─────────────────────────────────────────────
 
-// Send serializa e envia uma mensagem pelo WebSocket.
-// Thread-safe: usa mutex para evitar escrita concorrente.
+// Send é chamado pelo executor para gravar o resultado do comando no Firestore.
 func (a *Agent) Send(msg types.Message) error {
-	data, err := json.Marshal(msg)
+	if a.client == nil {
+		return fmt.Errorf("cliente Firestore não inicializado")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmdDocRef := a.client.Collection("devices").Doc(a.hostname).Collection("commands").Doc(msg.MsgID)
+
+	var status string
+	var resultData interface{}
+	var resultErr interface{}
+
+	switch msg.Type {
+	case types.TypeResultOk:
+		status = "completed"
+		if p, ok := msg.Payload.(types.ResultOKPayload); ok {
+			resultData = p.Data
+		} else if m, ok := msg.Payload.(map[string]interface{}); ok {
+			resultData = m["data"]
+		}
+	case types.TypeResultRollback:
+		status = "rollback"
+		if p, ok := msg.Payload.(types.ResultRollbackPayload); ok {
+			resultData = p.RevertedTo
+			resultErr = map[string]string{"reason": p.Reason}
+		}
+	case types.TypeResultError:
+		status = "error"
+		if p, ok := msg.Payload.(types.ResultErrorPayload); ok {
+			resultErr = p.Error
+		} else if m, ok := msg.Payload.(map[string]interface{}); ok {
+			resultErr = m["error"]
+		}
+	default:
+		status = "completed"
+		resultData = msg.Payload
+	}
+
+	updates := []firestore.Update{
+		{Path: "status", Value: status},
+		{Path: "updated_at", Value: firestore.ServerTimestamp},
+	}
+	if resultData != nil {
+		updates = append(updates, firestore.Update{Path: "result_data", Value: resultData})
+	}
+	if resultErr != nil {
+		updates = append(updates, firestore.Update{Path: "error", Value: resultErr})
+	}
+
+	_, err := cmdDocRef.Update(ctx, updates)
 	if err != nil {
-		return fmt.Errorf("falha ao serializar mensagem: %w", err)
+		a.logger.Error("falha ao atualizar resultado do comando no Firestore", "id", msg.MsgID, "err", err)
+		return err
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.conn == nil {
-		return fmt.Errorf("sem conexão ativa")
-	}
-
-	a.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	return a.conn.WriteMessage(websocket.TextMessage, data)
-}
-
-// ─────────────────────────────────────────────
-// BACKOFF EXPONENCIAL
-// ─────────────────────────────────────────────
-
-// backoffDelay calcula o tempo de espera antes de reconectar.
-// Fórmula: min(initialDelay * 2^(attempt-1), maxDelay)
-func (a *Agent) backoffDelay(attempt int) time.Duration {
-	initial := float64(a.cfg.Reconnect.InitialDelayS)
-	if initial <= 0 {
-		initial = 1
-	}
-	maxDelay := float64(a.cfg.Reconnect.MaxDelayS)
-	if maxDelay <= 0 {
-		maxDelay = 60
-	}
-
-	delay := initial * math.Pow(2, float64(attempt-1))
-	if delay > maxDelay {
-		delay = maxDelay
-	}
-
-	return time.Duration(delay) * time.Second
+	a.logger.Info("resultado do comando gravado com sucesso", "id", msg.MsgID, "status", status)
+	return nil
 }
