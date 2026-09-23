@@ -56,7 +56,7 @@ export function CompanyManagerModal({ onClose }: CompanyManagerModalProps) {
       toast.success(`"${c.name}" criada`)
       invalidate(); backToList()
     },
-    onError: () => toast.error('Falha ao criar empresa'),
+    onError: (err: Error) => toast.error(err?.message || 'Falha ao criar empresa'),
   })
 
   const updateMutation = useMutation({
@@ -65,7 +65,7 @@ export function CompanyManagerModal({ onClose }: CompanyManagerModalProps) {
       toast.success(`"${c.name}" atualizada`)
       invalidate(); backToList()
     },
-    onError: () => toast.error('Falha ao atualizar empresa'),
+    onError: (err: Error) => toast.error(err?.message || 'Falha ao atualizar empresa'),
   })
 
   const deleteMutation = useMutation({
@@ -75,7 +75,7 @@ export function CompanyManagerModal({ onClose }: CompanyManagerModalProps) {
       toast.success(`"${name}" excluída`)
       invalidate()
     },
-    onError: () => toast.error('Falha ao excluir empresa'),
+    onError: (err: Error) => toast.error(err?.message || 'Falha ao excluir empresa'),
   })
 
   const invalidate = () => {

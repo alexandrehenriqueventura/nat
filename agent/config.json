@@ -1,5 +1,5 @@
 {
-  "project_id": "seu-projeto-firebase",
+  "project_id": "nat-gestao",
   "credentials_file": "service_account.json",
   "hostname_override": "",
   "alias": "Terminal Caixa",
