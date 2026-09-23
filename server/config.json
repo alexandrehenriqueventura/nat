@@ -1,0 +1,8 @@
+{
+  "http_port":      8080,
+  "agent_token":    "TROQUE_PELO_TOKEN_SECRETO",
+  "operator_token": "TROQUE_PELO_TOKEN_OPERADOR",
+  "db_path":        "./nat.db",
+  "cors_origins":   ["http://localhost:5173", "https://seu-painel.vercel.app"],
+  "agent_timeout_s": 30
+}
