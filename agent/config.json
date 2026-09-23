@@ -1,14 +1,12 @@
-// config.json — Arquivo de configuração do Agente.
-// Coloque este arquivo na mesma pasta do executável (.exe).
 {
-  "server_url":   "wss://SEU_SERVIDOR:8080/ws/agent",
-  "auth_token":   "TROQUE_PELO_TOKEN_SECRETO",
+  "server_url": "ws://localhost:8080/ws/agent",
+  "auth_token": "TROQUE_PELO_TOKEN_SECRETO",
   "hostname_override": "",
-  "alias":        "Caixa Frente Loja",
-  "log_level":    "info",
+  "alias": "Terminal Teste Mac",
+  "log_level": "info",
   "reconnect": {
-    "initial_delay_s":  1,
-    "max_delay_s":      60,
-    "max_attempts":     0
+    "initial_delay_s": 1,
+    "max_delay_s": 60,
+    "max_attempts": 0
   }
 }

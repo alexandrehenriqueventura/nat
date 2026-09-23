@@ -45,7 +45,7 @@ func main() {
 		logger.Error("server_url não configurado no config.json")
 		os.Exit(1)
 	}
-	if cfg.AuthToken == "" || cfg.AuthToken == "TROQUE_PELO_TOKEN_SECRETO" {
+	if cfg.AuthToken == "" {
 		logger.Error("auth_token não configurado no config.json")
 		os.Exit(1)
 	}
